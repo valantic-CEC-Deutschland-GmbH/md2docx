@@ -40,15 +40,17 @@ npm install
 node md2docx.js input.md
 ```
 
-The `.docx` file is saved next to the input file. Existing files are overwritten.
+The `.docx` file is automatically created in the same directory with the same name. Existing files are overwritten.
+
+Optionally, you can specify a custom output path:
+
+```bash
+node md2docx.js input.md output.docx
+```
 
 ## Logo
 
-The default logo `valantic-logo.png` from the project directory is used automatically. To use a different logo:
-
-```bash
-node md2docx.js input.md output.docx --logo path/to/logo.png
-```
+The valantic logo (`valantic-logo.png`) from the project directory is used automatically in the document header.
 
 ## Fonts
 
@@ -64,8 +66,10 @@ The fonts must be installed on the system where the document is opened. Segoe UI
 
 ## Example
 
-A complete example is available in the `examples/` folder:
+A complete example Markdown file is available in the `examples/` folder. You can use it to see the supported formatting and try out the converter:
 
 ```bash
-node md2docx.js examples/example.md examples/example.docx
+node md2docx.js examples/example.md
 ```
+
+The `.docx` file is automatically created in the same directory with the same name (`examples/example.docx`).
