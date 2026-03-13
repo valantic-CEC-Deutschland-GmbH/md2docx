@@ -1,0 +1,11 @@
+.idea
+node_modules/
+*.docx
+~$*
+.DS_Store
+.claude
+*.md
+!README.md
+!examples/example.docx
+!examples/example.md
+
