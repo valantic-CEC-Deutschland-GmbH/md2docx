@@ -6,6 +6,7 @@
  *   node md2docx.js eingabe.md
  *   node md2docx.js eingabe.md ausgabe.docx
  *   node md2docx.js eingabe.md ausgabe.docx --logo pfad/zum/logo.png
+ *   node md2docx.js eingabe.md --pdf      → zusätzlich PDF (über Word, sonst LibreOffice)
  *
  * Logo:    Standard ist "valantic-logo.png" im gleichen Verzeichnis wie das Script.
  * Styles:  Alle valantic CI-Styles sind direkt eingebaut (berschrift1–4, Quellcode, Infobox etc.)
@@ -51,7 +52,10 @@ if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
     node md2docx.js eingabe.md
     node md2docx.js eingabe.md ausgabe.docx
     node md2docx.js eingabe.md ausgabe.docx --logo pfad/logo.png
+    node md2docx.js eingabe.md --pdf
 
+  --pdf          erzeugt zusätzlich eine PDF-Datei neben der .docx
+                 (über Microsoft Word, sonst LibreOffice)
   Logo-Standard: valantic-logo.png im gleichen Verzeichnis wie das Script.
   `);
     process.exit(0);
@@ -61,6 +65,9 @@ const inputPath  = path.resolve(args[0]);
 const outputPath = (args[1] && !args[1].startsWith('--'))
     ? path.resolve(args[1])
     : inputPath.replace(/\.md$/i, '.docx');
+
+const wantPdf  = args.includes('--pdf');
+const pdfPath  = outputPath.replace(/\.docx$/i, '') + '.pdf';
 
 const logoFlag = args.indexOf('--logo');
 const logoPath = logoFlag >= 0
@@ -239,7 +246,13 @@ function spacer(sz = 120) {
 // ─── Tabellen ─────────────────────────────────────────────────────────────────
 function parseTableRow(line) {
     // Zellen nur an nicht maskierten "|" trennen (\| bleibt Teil des Zellinhalts)
-    return line.trim().replace(/^\|/, '').replace(/(?<!\\)\|$/, '').split(/(?<!\\)\|/).map(c => c.trim());
+    return line.trim().replace(/^\|/, '').replace(/(?<!\\)\|$/, '').split(/(?<!\\)\|/).map(c => keepTogether(c.trim()));
+}
+
+// Zahl und Einheit bzw. Zahl und Klammer nicht trennen: "5 s", "120 ms", "10 %", "4,836 (4,831)"
+// → geschütztes Leerzeichen (U+00A0), damit Word dort nicht umbricht.
+function keepTogether(text) {
+    return text.replace(/(\d) (?=(?:ms|s|min|h|%|pt|KB|MB|GB)(?![\w])|\()/g, '$1\u00A0');
 }
 
 function isAlignRow(line) {
@@ -265,7 +278,7 @@ function columnWidths(headerCells, dataRows, fontSize) {
     for (let c = 0; c < n; c++) {
         const texts   = [headerCells[c], ...dataRows.map(r => r[c] || '')].map(plainText);
         const longest = Math.max(...texts.map(t => t.length), 1);
-        const word    = Math.max(...texts.flatMap(t => t.split(/\s+/)).map(w => w.length), 1);
+        const word    = Math.max(...texts.flatMap(t => t.split(/[ \t]+/)).map(w => w.length), 1);
         minW.push(Math.min(word, 18) * charW + pad);
         wantW.push(Math.min(longest, 80) * charW + pad);
     }
@@ -595,9 +608,11 @@ function parseMarkdown(md) {
 }
 
 // ─── Document bauen ───────────────────────────────────────────────────────────
-function buildDocument(elements, numberingConfigs, docTitle) {
+function buildDocument(elements, numberingConfigs, docTitle, updateFields = true) {
     return new Document({
-        features:  { updateFields: true },
+        // updateFields: Word fragt beim Öffnen, ob das Inhaltsverzeichnis aktualisiert werden soll.
+        // Für die PDF-Erzeugung aus, sonst wartet Word auf den Dialog.
+        features:  { updateFields },
         numbering: { config: numberingConfigs },
         styles: {
             default: { document: { run: { font: "Segoe UI", size: SZ.body } } },
@@ -684,15 +699,41 @@ console.log(`📄 Lese:   ${inputPath}`);
 if (hasLogo) console.log(`🖼  Logo:   ${logoPath}`);
 
 const { elements, numberingConfigs, docTitle, hasTOC } = parseMarkdown(md);
-const doc = buildDocument(elements, numberingConfigs, docTitle);
 
-Packer.toBuffer(doc).then(buf => {
-    fs.writeFileSync(outputPath, buf);
+async function main() {
+    const doc = buildDocument(elements, numberingConfigs, docTitle);
+    fs.writeFileSync(outputPath, await Packer.toBuffer(doc));
     console.log(`✅ Fertig: ${outputPath}`);
+
+    if (wantPdf) {
+        const { convertToPdf } = require('./pdf');
+        // Eigene Kopie ohne "Felder aktualisieren?"-Dialog; Word aktualisiert das Inhaltsverzeichnis selbst.
+        // Liegt im Zielordner, weil Word dort Zugriff hat (macOS-Sandbox).
+        const tmpDocx = outputPath.replace(/\.docx$/i, '') + `.pdf-tmp-${process.pid}.docx`;
+        const pdfDoc  = buildDocument(elements, numberingConfigs, docTitle, false);
+        fs.writeFileSync(tmpDocx, await Packer.toBuffer(pdfDoc));
+        try {
+            fs.rmSync(pdfPath, { force: true });
+            console.log(`⏳ PDF wird erzeugt …`);
+            const engine = convertToPdf(tmpDocx, pdfPath);
+            console.log(`✅ PDF:    ${pdfPath} (über ${engine})`);
+            if (engine !== 'Word' && hasTOC) {
+                console.log(`ℹ  Ohne Word wird das Inhaltsverzeichnis im PDF evtl. nicht gefüllt.`);
+            }
+        } finally {
+            fs.rmSync(tmpDocx, { force: true });
+            // Word-Sperrdatei (~$…) entfernen, falls Word abgebrochen wurde
+            const lock = path.join(path.dirname(tmpDocx), '~$' + path.basename(tmpDocx).slice(2));
+            fs.rmSync(lock, { force: true });
+        }
+    }
+
     if (hasTOC) {
         console.log(`ℹ  TOC: In Word Strg+A → F9 drücken um Inhaltsverzeichnis zu aktualisieren.`);
     }
-}).catch(err => {
+}
+
+main().catch(err => {
     console.error('Fehler:', err.message);
     process.exit(1);
 });
