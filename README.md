@@ -19,12 +19,17 @@ Converts Markdown files into Word documents (`.docx`) with valantic corporate st
 | `### Heading` | Heading 3 — Segoe UI Semibold 14pt |
 | `#### Heading` | Heading 4 — Segoe UI Semibold 11pt |
 | `**bold**` | Bold |
+| `*italic*` / `_italic_` | Italic (`***text***` = bold + italic) |
 | `` `code` `` | Consolas inline |
+| `[text](https://…)` | Clickable hyperlink (blue, underlined). Relative links (e.g. `other.md`) are output as plain text |
+| `\*` `\_` `\|` `` \` `` | Escaped character, output literally (e.g. `\|` inside a table cell) |
 | ` ```code``` ` | Consolas code block |
-| `- item` | Bullet list |
+| `- item` | Bullet list (`-`, `*` or `+`) |
 | `1. item` | Numbered list |
+| Indented list items | Nested lists, up to 3 levels; bullets and numbers can be mixed |
+| Indented line after a list item | Continues the same list item (no new paragraph, numbering continues) |
 | `> quote` | Blockquote with blue border |
-| `| table |` | Formatted table with alternating rows |
+| `| table |` | Formatted table with alternating rows. Column widths follow the content (narrow columns stay narrow); 10 pt font from 5 columns, 9 pt from 6, 8 pt from 10 columns |
 | `---` | Horizontal line |
 | `[TOC]` | Table of contents |
 

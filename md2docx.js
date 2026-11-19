@@ -17,12 +17,15 @@
  *   #### H3         → Heading 3 (Segoe UI Semibold 14pt)
  *   ##### H4        → Heading 4 (Segoe UI Semibold 11pt)
  *   **fett**        → Bold
+ *   *kursiv* / _kursiv_ → Italic, ***fett+kursiv***
  *   `inline code`   → Consolas 11pt
+ *   [Text](url)     → Hyperlink (http/https/mailto), relative Links als Text
+ *   \* \_ \| \`     → Escapes, Zeichen wird wörtlich ausgegeben
  *   ```codeblock``` → Consolas eingerückt
- *   - / * Liste     → Bullet
- *   1. Liste        → Nummeriert
+ *   - / * / + Liste → Bullet (verschachtelt bis 3 Ebenen, mehrzeilige Punkte)
+ *   1. Liste        → Nummeriert (auch gemischt mit Bullets)
  *   > Blockquote    → Blauer linker Rand
- *   | Tabelle |     → CI-Tabelle
+ *   | Tabelle |     → CI-Tabelle, Spaltenbreite nach Inhalt, kleinere Schrift ab 5 Spalten
  *   ---             → Trennlinie
  *   [TOC]           → Inhaltsverzeichnis (Headings 1-4)
  */
@@ -33,7 +36,7 @@ const {
     Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
     Header, Footer, HeadingLevel, BorderStyle, WidthType, ShadingType,
     AlignmentType, LevelFormat, VerticalAlign, ImageRun, TableOfContents,
-    PageNumber
+    PageNumber, ExternalHyperlink
 } = require('docx');
 const fs   = require('fs');
 const path = require('path');
@@ -82,6 +85,7 @@ const ALT_BG    = "F2F2F2";
 const HDR_LINE  = "677A82";
 const QUOTE_CLR = "2E4A6B";
 const QUOTE_BDR = "2E75B6";
+const LINK_CLR  = "0563C1";
 
 const SZ = { title: 60, h1: 44, h2: 32, h3: 28, h4: 22, body: 22 };
 
@@ -96,28 +100,83 @@ if (fs.existsSync(logoPath)) {
 }
 
 // ─── Inline-Parser ────────────────────────────────────────────────────────────
-function parseInline(text, base = {}) {
+// Escapes (\* \_ \| \` \[ \] \\) werden vor dem Parsen durch Platzhalter aus dem
+// Private-Use-Bereich ersetzt und danach wiederhergestellt.
+const ESC_RX = /\\([\\`*_\[\]|#])/g;
+const escapeMd   = s => s.replace(ESC_RX, (_, c) => String.fromCharCode(0xE000 + c.charCodeAt(0)));
+const unescapeMd = s => s.replace(/[-]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xE000));
+
+// Reihenfolge: Code, Link, fett+kursiv, fett, kursiv (*), kursiv (_)
+const INLINE_RX = new RegExp([
+    '`([^`]+?)`',                                         // 1 code
+    '\\[([^\\]]+)\\]\\(([^)\\s]+)\\)',                    // 2 linktext, 3 url
+    '\\*\\*\\*(.+?)\\*\\*\\*',                            // 4 fett+kursiv
+    '\\*\\*(.+?)\\*\\*',                                  // 5 fett
+    '(?<![\\w*])\\*(?![\\s*])(.+?)(?<![\\s*])\\*(?![\\w*])', // 6 kursiv *
+    '(?<![\\w_])_(?![\\s_])(.+?)(?<![\\s_])_(?![\\w_])',     // 7 kursiv _
+].join('|'), 'g');
+
+function parseInlineEscaped(text, base) {
     const runs = [];
-    const rx   = /(\*\*(.+?)\*\*|`([^`]+?)`)/g;
+    const rx   = new RegExp(INLINE_RX.source, 'g');
     let last   = 0, m;
     while ((m = rx.exec(text)) !== null) {
         if (m.index > last) runs.push({ ...base, text: text.slice(last, m.index) });
-        if (m[2] !== undefined) runs.push({ ...base, bold: true,       text: m[2] });
-        else                    runs.push({ ...base, font: "Consolas", text: m[3] });
+        if      (m[1] !== undefined) runs.push({ ...base, font: "Consolas", text: m[1] });
+        else if (m[2] !== undefined) runs.push(...parseInlineEscaped(m[2], { ...base, link: unescapeMd(m[3]) }));
+        else if (m[4] !== undefined) runs.push(...parseInlineEscaped(m[4], { ...base, bold: true, italics: true }));
+        else if (m[5] !== undefined) runs.push(...parseInlineEscaped(m[5], { ...base, bold: true }));
+        else if (m[6] !== undefined) runs.push(...parseInlineEscaped(m[6], { ...base, italics: true }));
+        else                         runs.push(...parseInlineEscaped(m[7], { ...base, italics: true }));
         last = m.index + m[0].length;
     }
     if (last < text.length) runs.push({ ...base, text: text.slice(last) });
-    return runs.length ? runs : [{ ...base, text }];
+    return runs;
 }
 
-function toRuns(text, base = {}) {
-    return parseInline(text, base).map(r => new TextRun({
-        font:  r.font || (r.bold ? "Segoe UI Semibold" : "Segoe UI"),
-        size:  r.size  || SZ.body,
-        bold:  !!r.bold,
-        color: r.color || undefined,
-        text:  r.text
-    }));
+function parseInline(text, base = {}) {
+    const runs = parseInlineEscaped(escapeMd(text), base).map(r => ({ ...r, text: unescapeMd(r.text) }));
+    return runs.length ? runs : [{ ...base, text: unescapeMd(escapeMd(text)) }];
+}
+
+// Text ohne Markdown-Formatierung (für Überschriften, Header, Spaltenbreiten)
+function plainText(text) {
+    return parseInline(text).map(r => r.text).join('');
+}
+
+const isExternalLink = url => /^(https?:|mailto:)/i.test(url || '');
+
+// Baut TextRuns; aufeinanderfolgende Runs mit gleichem externen Link werden zu
+// einem anklickbaren Hyperlink zusammengefasst. Relative Links (z. B. auf andere
+// .md-Dateien) werden als normaler Text ausgegeben.
+// opts.boldFont: Schrift für fetten Text (Standard: Segoe UI Semibold)
+function toRuns(text, base = {}, opts = {}) {
+    const boldFont = opts.boldFont || "Segoe UI Semibold";
+    const out = [];
+    let linkGroup = null;
+    for (const r of parseInline(text, base)) {
+        const link = isExternalLink(r.link) ? r.link : null;
+        const run  = new TextRun({
+            font:      r.font || (r.bold ? boldFont : "Segoe UI"),
+            size:      r.size || SZ.body,
+            bold:      !!r.bold,
+            italics:   !!r.italics,
+            color:     link ? LINK_CLR : (r.color || undefined),
+            underline: link ? {} : undefined,
+            text:      r.text
+        });
+        if (link) {
+            if (!linkGroup || linkGroup.link !== link) {
+                linkGroup = { link, children: [] };
+                out.push(linkGroup);
+            }
+            linkGroup.children.push(run);
+        } else {
+            linkGroup = null;
+            out.push(run);
+        }
+    }
+    return out.map(x => x instanceof TextRun ? x : new ExternalHyperlink({ link: x.link, children: x.children }));
 }
 
 // ─── Absatz-Helfer ────────────────────────────────────────────────────────────
@@ -135,7 +194,7 @@ const HEADING_SIZE = { 1: 44, 2: 32, 3: 28, 4: SZ.body };
 function hPara(text, level) {
     return new Paragraph({
         style:    HEADING_STYLE[level],
-        children: [new TextRun({ text, font: HEADING_FONT, size: HEADING_SIZE[level], bold: level === 1 })]
+        children: [new TextRun({ text: plainText(text), font: HEADING_FONT, size: HEADING_SIZE[level], bold: level === 1 })]
     });
 }
 
@@ -143,6 +202,7 @@ function bodyPara(text, opts = {}) {
     return new Paragraph({
         spacing:   { before: opts.before || 60, after: opts.after || 60 },
         numbering:  opts.numbering,
+        indent:     opts.indent,
         children:   toRuns(text, { size: SZ.body })
     });
 }
@@ -178,29 +238,67 @@ function spacer(sz = 120) {
 
 // ─── Tabellen ─────────────────────────────────────────────────────────────────
 function parseTableRow(line) {
-    return line.replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+    // Zellen nur an nicht maskierten "|" trennen (\| bleibt Teil des Zellinhalts)
+    return line.trim().replace(/^\|/, '').replace(/(?<!\\)\|$/, '').split(/(?<!\\)\|/).map(c => c.trim());
 }
 
 function isAlignRow(line) {
     return /^\|[\s|:-]+\|$/.test(line.trim());
 }
 
+// Schriftgröße in Tabellen: bei vielen Spalten kleiner, damit der Text lesbar umbricht
+function tableFontSize(n) {
+    if (n >= 10) return 16;  // 8 pt
+    if (n >= 6) return 18;   // 9 pt
+    if (n === 5) return 20;  // 10 pt
+    return SZ.body;          // 11 pt
+}
+
+// Spaltenbreiten nach Inhalt: schmale Spalten (z. B. "#", Zahlen) werden schmal,
+// Spalten mit langem Text bekommen mehr Platz. Das längste Wort einer Spalte
+// bestimmt die Mindestbreite, damit Wörter nicht mitten im Wort umbrechen.
+function columnWidths(headerCells, dataRows, fontSize) {
+    const n = headerCells.length;
+    const charW = fontSize * 5.5;            // ungefähre Zeichenbreite in DXA (Segoe UI)
+    const pad   = 200;                        // Zellenränder links + rechts
+    const minW  = [], wantW = [];
+    for (let c = 0; c < n; c++) {
+        const texts   = [headerCells[c], ...dataRows.map(r => r[c] || '')].map(plainText);
+        const longest = Math.max(...texts.map(t => t.length), 1);
+        const word    = Math.max(...texts.flatMap(t => t.split(/\s+/)).map(w => w.length), 1);
+        minW.push(Math.min(word, 18) * charW + pad);
+        wantW.push(Math.min(longest, 80) * charW + pad);
+    }
+    const sumMin  = minW.reduce((a, b) => a + b, 0);
+    const sumWant = wantW.reduce((a, b) => a + b, 0);
+    let colW;
+    if (sumWant <= CONTENT_W) {
+        // alles passt: überschüssigen Platz proportional verteilen
+        colW = wantW.map(w => w * CONTENT_W / sumWant);
+    } else if (sumMin >= CONTENT_W) {
+        colW = minW.map(w => w * CONTENT_W / sumMin);
+    } else {
+        // Mindestbreite garantieren, Rest nach Bedarf verteilen
+        const rest  = CONTENT_W - sumMin;
+        const extra = wantW.map((w, i) => w - minW[i]);
+        const sumEx = extra.reduce((a, b) => a + b, 0) || 1;
+        colW = minW.map((w, i) => w + rest * extra[i] / sumEx);
+    }
+    colW = colW.map(Math.floor);
+    colW[n - 1] += CONTENT_W - colW.reduce((a, b) => a + b, 0);
+    return colW;
+}
+
 function buildTable(headerCells, dataRows) {
-    const n    = headerCells.length;
-    const w    = Math.floor(CONTENT_W / n);
-    const colW = Array(n).fill(w);
-    colW[n - 1] = CONTENT_W - w * (n - 1);
+    const n        = headerCells.length;
+    const fontSize = tableFontSize(n);
+    const colW     = columnWidths(headerCells, dataRows, fontSize);
 
     const none     = { style: BorderStyle.NONE,   size: 0, color: "FFFFFF" };
     const solidBdr = { style: BorderStyle.SINGLE, size: 4, color: "AAAAAA" };
 
     function makeCell(text, isHdr, colIdx, altRow) {
-        const runs = parseInline(text, { size: SZ.body }).map(r => new TextRun({
-            font: r.font || "Segoe UI",
-            size: SZ.body,
-            bold: isHdr ? true : !!r.bold,
-            text: r.text
-        }));
+        const runs = toRuns(text, { size: fontSize, bold: isHdr || undefined }, { boldFont: "Segoe UI" });
         const borders = isHdr
             ? { top: none, left: none, right: none, bottom: solidBdr }
             : { top: none, bottom: none, left: colIdx === 0 ? none : solidBdr, right: none };
@@ -239,7 +337,7 @@ function buildHeader(titleText) {
         margins:       { top: 0, bottom: 0, left: 0, right: 0 },
         verticalAlign: VerticalAlign.CENTER,
         children: [new Paragraph({
-            children: [new TextRun({ text: titleText, font: "Segoe UI", size: 18, color: "555555" })]
+            children: [new TextRun({ text: plainText(titleText), font: "Segoe UI", size: 18, color: "555555" })]
         })]
     });
 
@@ -345,22 +443,74 @@ function parseMarkdown(md) {
     let   docTitle         = '';
     let   hasTOC           = false;
 
+    const BULLET_CHARS = ["•", "◦", "▪"];
+    const levelIndent  = lvl => ({ left: 360 * (lvl + 1), hanging: 360 });
+
     function newBulletRef() {
         const ref = `bullet-${bulletRef++}`;
-        numberingConfigs.push({ reference: ref, levels: [{
-                level: 0, format: LevelFormat.BULLET, text: "•", alignment: AlignmentType.LEFT,
-                style: { paragraph: { indent: { left: 360, hanging: 360 } } }
-            }]});
+        numberingConfigs.push({ reference: ref, levels: [0, 1, 2].map(lvl => ({
+                level: lvl, format: LevelFormat.BULLET, text: BULLET_CHARS[lvl], alignment: AlignmentType.LEFT,
+                style: { paragraph: { indent: levelIndent(lvl) } }
+            }))});
         return ref;
     }
 
     function newNumberRef() {
         const ref = `number-${numberRef++}`;
-        numberingConfigs.push({ reference: ref, levels: [{
-                level: 0, format: LevelFormat.DECIMAL, text: "%1.", alignment: AlignmentType.LEFT,
-                style: { paragraph: { indent: { left: 360, hanging: 360 } } }
-            }]});
+        numberingConfigs.push({ reference: ref, levels: [0, 1, 2].map(lvl => ({
+                level: lvl, format: LevelFormat.DECIMAL, text: `%${lvl + 1}.`, alignment: AlignmentType.LEFT,
+                style: { paragraph: { indent: levelIndent(lvl) } }
+            }))});
         return ref;
+    }
+
+    // Erkennt Zeilen, die einen neuen Block beginnen (beendet Absätze und Listenpunkte)
+    function isBlockStart(t) {
+        return /^#{1,6}\s/.test(t) || t.startsWith('|') || t.startsWith('>') || t.startsWith('```') ||
+               /^---+$/.test(t) || /^\[TOC\]$/i.test(t) || /^\{toc\}$/i.test(t);
+    }
+
+    const LIST_RX = /^(\s*)([-*+]|\d+\.)\s+(.*)$/;
+
+    // Liest eine komplette Liste ab Zeile i: mehrzeilige Punkte, Verschachtelung
+    // (Einrückung 2+ Leerzeichen bzw. Tab = eine Ebene, max. 3 Ebenen) und
+    // gemischte Listen (z. B. Nummern mit Unterpunkten). Eine Liste läuft über
+    // Leerzeilen weiter, solange danach wieder ein Listenpunkt folgt.
+    function parseList(i) {
+        const refs   = {};              // "bullet-0", "number-1" → reference (pro Liste und Ebene)
+        const indents = [];             // Einrückung (Spalten) je Ebene
+        // Gleicher Typ wie die oberste Ebene → dieselbe Referenz (Word nummeriert
+        // Unterebenen dann pro Oberpunkt neu); anderer Typ → eigene Referenz.
+        const refFor = (ordered, lvl) => {
+            const type = ordered ? 'n' : 'b';
+            const key  = refs[`${type}0`] ? `${type}0` : `${type}${lvl}`;
+            if (!refs[key]) refs[key] = ordered ? newNumberRef() : newBulletRef();
+            return refs[key];
+        };
+        while (i < lines.length) {
+            const m = lines[i].replace(/\t/g, '    ').match(LIST_RX);
+            if (!m) break;
+            const col = m[1].length;
+            while (indents.length && col < indents[indents.length - 1]) indents.pop();
+            if (!indents.length || col > indents[indents.length - 1]) indents.push(col);
+            const lvl     = Math.min(indents.length - 1, 2);
+            const ordered = /\d/.test(m[2]);
+            let text = m[3];
+            i++;
+            // Folgezeilen des Listenpunkts (eingerückt oder "lazy") anhängen
+            while (i < lines.length) {
+                const t = lines[i].trim();
+                if (t === '' || isBlockStart(t) || LIST_RX.test(lines[i].replace(/\t/g, '    '))) break;
+                text += ' ' + t;
+                i++;
+            }
+            elements.push(bodyPara(text, { numbering: { reference: refFor(ordered, lvl), level: lvl }, before: 40, after: 40 }));
+            // Leerzeile(n) innerhalb der Liste überspringen, wenn danach ein Listenpunkt folgt
+            let j = i;
+            while (j < lines.length && lines[j].trim() === '') j++;
+            if (j > i && j < lines.length && LIST_RX.test(lines[j].replace(/\t/g, '    '))) i = j;
+        }
+        return i;
     }
 
     let i = 0;
@@ -421,21 +571,8 @@ function parseMarkdown(md) {
             continue;
         }
 
-        if (/^[-*]\s/.test(trimmed)) {
-            const ref = newBulletRef();
-            while (i < lines.length && /^[-*]\s/.test(lines[i].trim())) {
-                elements.push(bodyPara(lines[i].trim().replace(/^[-*]\s/, ''), { numbering: { reference: ref, level: 0 }, before: 40, after: 40 }));
-                i++;
-            }
-            continue;
-        }
-
-        if (/^\d+\.\s/.test(trimmed)) {
-            const ref = newNumberRef();
-            while (i < lines.length && /^\d+\.\s/.test(lines[i].trim())) {
-                elements.push(bodyPara(lines[i].trim().replace(/^\d+\.\s/, ''), { numbering: { reference: ref, level: 0 }, before: 40, after: 40 }));
-                i++;
-            }
+        if (LIST_RX.test(line.replace(/\t/g, '    '))) {
+            i = parseList(i);
             continue;
         }
 
@@ -445,14 +582,8 @@ function parseMarkdown(md) {
         while (
             i < lines.length &&
             lines[i].trim() !== '' &&
-            !/^#{1,5}\s/.test(lines[i].trim()) &&
-            !lines[i].trim().startsWith('|') &&
-            !lines[i].trim().startsWith('>') &&
-            !lines[i].trim().startsWith('```') &&
-            !/^[-*]\s/.test(lines[i].trim()) &&
-            !/^\d+\.\s/.test(lines[i].trim()) &&
-            !/^---+$/.test(lines[i].trim()) &&
-            !/^\[TOC\]$/i.test(lines[i].trim())
+            !isBlockStart(lines[i].trim()) &&
+            !LIST_RX.test(lines[i].replace(/\t/g, '    '))
             ) {
             paraText += ' ' + lines[i].trim();
             i++;
